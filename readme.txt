@@ -4,3 +4,5 @@
 # 3. Run TLC model checker
     java -Xmx30g -cp tla2tools-json-test.jar tlc2.TLC -noGenerateSpecTE -seed 10 -dump json shared.json -fp 10 -workers auto -deadlock -config SchedulerSharedBlocks.cfg SchedulerSharedBlocks.tla
     python replayer_shared.py --states shared-states.json --edges shared-edges.json --max-paths 7 --target any 2>&1 | tee replayer_shared.log
+
+The TLC jar file is sourced from this repository https://github.com/mongodb-labs/vldb25-dist-txns/ 
