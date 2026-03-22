@@ -18,8 +18,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import Mock
+import os
 
-sys.path.append("../../../vllm")
+sys.path.append(os.environ["VLLM_PATH"])
 
 from tests.v1.kv_connector.unit.utils import (
     create_model_runner_output,
