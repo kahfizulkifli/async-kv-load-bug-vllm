@@ -18,9 +18,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import Mock
-import os
 
-sys.path.append(os.environ["VLLM_PATH"])
+sys.path.append("../../../vllm")
 
 from tests.v1.kv_connector.unit.utils import (
     create_model_runner_output,
@@ -45,6 +44,7 @@ MODEL = "facebook/opt-125m"
 # ─────────────────────────────────────────────────────────────────
 
 _req_counter = 0
+invariant_checking = False
 
 def _make_request(
     num_tokens: int,
@@ -473,7 +473,7 @@ def _handle_finished_recving(rs: ReplayState, params: dict) -> None:
     rs.sched.update_from_output(sched_out, mro)
     
 def _handle_cache_blocks(rs: ReplayState, params: dict,
-                         states: dict, to_fp: int) -> tuple[bool, str, int, int]:
+                         states: dict, to_fp: int, invariant_checking: bool) -> tuple[bool, str, int, int]:
     r   = params["r"]
     req = rs.req_map.get(r)
     if req is None:
@@ -482,29 +482,12 @@ def _handle_cache_blocks(rs: ReplayState, params: dict,
     tlc_backing_blocks = int(states[to_fp].val["backing"][r])
     safe_up_to_tokens  = tlc_backing_blocks * BLOCK_SIZE
 
-    # From this point on, use engine_core.step() so the model runner
-    # stays in sync. The connector is already set to (0, False).
-    set_connector(rs.sched.connector, 0, False)
-    
-    # Drive one step to let r1 be scheduled and executed (CacheBlocksRetry).
-    # The model runner will receive the NewRequestData for r1 here.
-    step_outputs, model_executed = rs.engine_core.step()
-    if model_executed:
-        # Collect any tokens from this step (r1's prefill result).
-        pass  # we don't need r1's tokens, just need to advance state
-
     credit_tokens  = rs.sched.requests[req.request_id].num_computed_tokens
     backing_tokens = safe_up_to_tokens
-    
+
     if req.request_id not in rs.sched.requests:
         print(f"  ○ KNOWN SPEC GAP (freed)  req={req.request_id} "
               f"credit={credit_tokens} backing={backing_tokens}")
-        return False, req.request_id, credit_tokens, backing_tokens
-
-    tlc_credit = int(states[to_fp].val["credit"][r]) * BLOCK_SIZE
-    suspect    = (credit_tokens > backing_tokens) or (credit_tokens != tlc_credit)
-
-    if not suspect:
         return False, req.request_id, credit_tokens, backing_tokens
 
     # ── Check sibling requests for the shared-block bug ───────────────────
@@ -517,7 +500,7 @@ def _handle_cache_blocks(rs: ReplayState, params: dict,
         other_credit  = rs.sched.requests[other_req.request_id].num_computed_tokens
         other_backing = int(states[to_fp].val["backing"].get(other_r, 0)) * BLOCK_SIZE
 
-        if other_credit <= other_backing:
+        if other_credit <= other_backing and invariant_checking:
             continue
 
         # Invariant violation confirmed for sibling.
@@ -568,20 +551,10 @@ def _handle_cache_blocks(rs: ReplayState, params: dict,
             print(f"  ✗ BUG CONFIRMED: outputs differ")
             return True, other_req.request_id, other_credit, other_backing
         else:
-            # Block was repaired by r1's recompute before r2 ran.
-            # The invariant was violated but the specific execution
-            # self-corrected. This is still a real bug — a different
-            # path ordering would expose wrong output.
-            print(f"  ~ INVARIANT VIOLATED but outputs match "
-                  f"(r1 repaired block before r2 ran)")
+            print(f" outputs match ")
             return False, other_req.request_id, other_credit, other_backing
 
     # ── Primary request check ─────────────────────────────────────────────
-    base_explanation = (
-        f"credit={credit_tokens} > backing={backing_tokens}"
-        if credit_tokens > backing_tokens
-        else f"credit={credit_tokens} != tlc_credit={tlc_credit}"
-    )
     corrupt_toks = _collect_tokens(rs.engine_core, req.request_id)
     clean_toks   = _run_clean_reference(list(req.prompt_token_ids))
 
@@ -589,10 +562,10 @@ def _handle_cache_blocks(rs: ReplayState, params: dict,
     print(f"    Run B (clean):   {clean_toks[:6]}")
 
     if corrupt_toks != clean_toks:
-        print(f"  ✗ BUG CONFIRMED: {base_explanation}")
+        print(f"  ✗ BUG CONFIRMED")
         return True, req.request_id, credit_tokens, backing_tokens
     else:
-        print(f"  ~ {base_explanation} but outputs match")
+        print(f"  outputs match")
         return False, req.request_id, credit_tokens, backing_tokens
 
 def _sync_model_runner(rs: ReplayState, sched_out: SchedulerOutput) -> None:
@@ -617,7 +590,7 @@ def _sync_model_runner(rs: ReplayState, sched_out: SchedulerOutput) -> None:
 # Path replay
 # ─────────────────────────────────────────────────────────────────
 
-def replay_path(path, states, path_idx) -> bool:
+def replay_path(path, states, path_idx, invariant_checking: bool) -> bool:
     engine_core = _make_engine_core()
     connector   = make_connector()
     engine_core.scheduler.connector = connector
@@ -633,7 +606,9 @@ def replay_path(path, states, path_idx) -> bool:
     # try:
     for edge in path:
         act, params = edge.act, edge.params
-        print(f"  {act} {params}")
+        print(f"  {act} {params} ")
+        print(f"  {states[edge.from_fp].val}")
+        print(f"  {states[edge.to_fp].val}")
         if act == "Arrive":
             _handle_arrive(rs, params, states, edge.to_fp)
         elif act == "PromiseAsync":
@@ -644,7 +619,7 @@ def replay_path(path, states, path_idx) -> bool:
             _handle_finished_recving(rs, params)
         elif act in ("CacheBlocks", "CacheBlocksRetry"):
             corrupt, req_id, credit, backing = _handle_cache_blocks(
-                rs, params, states, edge.to_fp)
+                rs, params, states, edge.to_fp, invariant_checking)
             if corrupt:
                 return True
             print(f"    OK: credit={credit} backing={backing}")
@@ -653,6 +628,10 @@ def replay_path(path, states, path_idx) -> bool:
         else:
             print(f"  [unknown action] {act}")
 
+        for req in rs.sched.requests.keys():
+            print(req, rs.sched.requests[req].status, rs.sched.requests[req].num_computed_tokens, rs.sched.kv_cache_manager.get_block_ids(req))
+
+    # In replay_path finally block:
     try:
         if rs.engine_core is not None:  # may have been shut down in _handle_cache_blocks
             rs.engine_core.shutdown()
@@ -673,6 +652,7 @@ def main() -> None:
     ap.add_argument("--edges",     required=True)
     ap.add_argument("--max-paths", type=int, default=50)
     ap.add_argument("--max-depth", type=int, default=20)
+    ap.add_argument("--invariant-checking", action='store_true')
     ap.add_argument("--target",    default="corrupt",
                     choices=["corrupt", "any"])
     args = ap.parse_args()
@@ -690,6 +670,11 @@ def main() -> None:
 
     paths = find_all_paths(states, adj, args.max_paths, args.max_depth,
                            args.target)
+    if args.invariant_checking:
+        invariant_checking = True
+    else: 
+        invariant_checking = False
+
     print(f"Found {len(paths)} paths (target={args.target})")
     if not paths:
         print("No paths found.")
@@ -698,7 +683,7 @@ def main() -> None:
     new_bugs = 0
     paths = paths[6:]
     for i, path in enumerate(paths, 1):
-        if replay_path(path, states, i):
+        if replay_path(path, states, i, invariant_checking):
             new_bugs += 1
 
     print(f"\n{'='*55}")
